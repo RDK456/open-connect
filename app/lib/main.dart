@@ -300,7 +300,7 @@ String downloadsDir() =>
 // Android downloads the full APK and hands it to the system installer.
 // ponytail: only the machine holding %APPDATA%\OpenConnect\updates publishes; no relay between peers.
 // ponytail: file-level delta: swap in bsdiff patches if app.so gets too big to resend.
-const appBuild = 3, appVersion = '1.1.0';
+const appBuild = 4, appVersion = '1.2.0';
 const updatePubKeyHex = 'e09bbb753be2c690205df098f4a057ee09b700d1bab748b48869ab0a1e587097';
 
 String updatesDir() => p.join(Platform.environment['APPDATA'] ?? Directory.systemTemp.path, 'OpenConnect', 'updates');

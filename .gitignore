@@ -14,3 +14,4 @@ app/android/.gradle/
 app/android/local.properties
 app/windows/flutter/ephemeral/
 app/linux/flutter/ephemeral/
+dist/
