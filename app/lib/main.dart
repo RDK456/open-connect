@@ -12,6 +12,8 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:crypto/crypto.dart' as hash;
@@ -97,7 +99,7 @@ class Host {
 
   Future<Response> _handle(Request r) async {
     final q = r.url.queryParameters, vp = q['p'] ?? '', path = r.url.path;
-    if (path == 'ping') return Response.ok('openconnect:${Platform.localHostname}');
+    if (path == 'ping') return Response.ok('openconnect:$deviceName');
     if (path == 'request' && r.method == 'POST') {
       if (pending.length > 20) return Response(429);
       final id = rand(8);
@@ -221,6 +223,26 @@ class Host {
       await copyTree(f, to);
       return Response.ok('');
     }
+    if (path == 'api/places') {
+      // the user's well-known folders, as virtual paths inside the shared roots
+      final home = Platform.isAndroid ? '/storage/emulated/0' : (Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'] ?? '');
+      final names = Platform.isAndroid
+          ? ['Download', 'DCIM', 'Pictures', 'Documents', 'Music', 'Movies']
+          : ['Desktop', 'Downloads', 'Documents', 'Pictures', 'Music', 'Videos'];
+      final out = <Map>[];
+      if (home.isNotEmpty) {
+        for (final n in names) {
+          final d = p.join(home, n);
+          for (final e in roots.entries) {
+            if (p.isWithin(e.value, d) && Directory(d).existsSync()) {
+              out.add({'n': n, 'p': '${e.key}/${p.relative(d, from: e.value).replaceAll('\\', '/')}'});
+              break;
+            }
+          }
+        }
+      }
+      return _json(out);
+    }
     if (path == 'api/mkdir' && r.method == 'POST') {
       final d = real(vp), n = p.basename(q['name'] ?? '');
       if (d == null || n.isEmpty) return Response(400);
@@ -248,7 +270,7 @@ Future<Peer?> ping(String ip) async {
   for (final s in ['http', 'https']) {
     try {
       final r = await client.get(Uri.parse('$s://$ip:$port/ping')).timeout(const Duration(seconds: 2));
-      if (r.body.startsWith('openconnect:')) return Peer('$s://$ip:$port', r.body.substring(11));
+      if (r.body.startsWith('openconnect:')) return Peer('$s://$ip:$port', r.body.substring('openconnect:'.length));
     } catch (_) {}
   }
   return null;
@@ -300,7 +322,14 @@ String downloadsDir() =>
 // Android downloads the full APK and hands it to the system installer.
 // ponytail: only the machine holding %APPDATA%\OpenConnect\updates publishes; no relay between peers.
 // ponytail: file-level delta: swap in bsdiff patches if app.so gets too big to resend.
-const appBuild = 4, appVersion = '1.2.0';
+const appBuild = 6, appVersion = '1.4.0';
+
+/// How this device appears to others (shown in their scan). Defaults to the computer name; editable in Settings.
+String deviceName = Platform.localHostname;
+Future<void> setDeviceName(String n) async {
+  deviceName = n.trim().isEmpty ? Platform.localHostname : n.trim();
+  await (await SharedPreferences.getInstance()).setString('deviceName', deviceName);
+}
 const updatePubKeyHex = 'e09bbb753be2c690205df098f4a057ee09b700d1bab748b48869ab0a1e587097';
 
 String updatesDir() => p.join(Platform.environment['APPDATA'] ?? Directory.systemTemp.path, 'OpenConnect', 'updates');
@@ -616,6 +645,7 @@ IconData fileIcon(String n) {
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+  MediaKit.ensureInitialized();
   if (args.contains('--update')) {
     // headless: install the newest signed release (relaunches the app on Windows) and exit
     final log = File(p.join(Directory.systemTemp.path, 'open-connect-update.log'));
@@ -634,6 +664,9 @@ void main(List<String> args) async {
     }
     exit(0);
   }
+  try {
+    deviceName = (await SharedPreferences.getInstance()).getString('deviceName') ?? deviceName;
+  } catch (_) {}
   await initBackground(args);
   host.approve = (who) async {
     // a hidden/minimized/covered window must still surface the prompt
@@ -825,7 +858,33 @@ class _DeviceCardState extends State<DeviceCard> {
             Row(children: [
               Icon(Platform.isAndroid ? Icons.phone_android : Icons.computer, color: cs.onPrimaryContainer),
               const SizedBox(width: 12),
-              Expanded(child: Text(Platform.localHostname, style: t.textTheme.titleLarge?.copyWith(color: cs.onPrimaryContainer))),
+              Expanded(child: Text(deviceName, style: t.textTheme.titleLarge?.copyWith(color: cs.onPrimaryContainer))),
+              IconButton(
+                tooltip: 'Rename this device',
+                icon: Icon(Icons.edit_outlined, color: cs.onPrimaryContainer),
+                onPressed: () async {
+                  final ctl = TextEditingController(text: deviceName);
+                  final n = await showDialog<String>(
+                    context: c,
+                    builder: (d) => AlertDialog(
+                      title: const Text('Device name'),
+                      content: TextField(
+                          controller: ctl,
+                          autofocus: true,
+                          maxLength: 40,
+                          decoration: InputDecoration(hintText: Platform.localHostname, helperText: 'Shown to other devices when they scan', border: const OutlineInputBorder()),
+                          onSubmitted: (v) => Navigator.pop(d, v)),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cancel')),
+                        FilledButton(onPressed: () => Navigator.pop(d, ctl.text), child: const Text('Save')),
+                      ],
+                    ),
+                  );
+                  if (n == null) return;
+                  await setDeviceName(n);
+                  if (mounted) setState(() {});
+                },
+              ),
             ]),
             const SizedBox(height: 4),
             Text(host.startError ?? 'Visible to other devices on this network. Tap an address to copy.',

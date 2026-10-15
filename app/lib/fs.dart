@@ -34,7 +34,7 @@ class LocalFs extends Fs {
   List<String>? _roots;
 
   @override
-  String get label => '${Platform.localHostname} (this device)';
+  String get label => '$deviceName (this device)';
   @override
   String join(String dir, String name) => dir.isEmpty ? name : p.join(dir, name);
   @override
@@ -149,6 +149,13 @@ class RemoteFs extends Fs {
         Entry(e['n'], e['d'] == true, (e['s'] ?? 0) as int,
             e['m'] == null ? null : DateTime.fromMillisecondsSinceEpoch(e['m'] as int))
     ];
+  }
+
+  /// Well-known folders (Desktop, Downloads...) of the remote device as (name, path).
+  Future<List<(String, String)>> places() async {
+    final r = await client.get(peer.u('api/places'), headers: peer.h);
+    if (r.statusCode != 200) return [];
+    return [for (final e in jsonDecode(r.body) as List) (e['n'] as String, e['p'] as String)];
   }
 
   @override

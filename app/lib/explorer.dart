@@ -7,11 +7,13 @@ import 'dart:math';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart' show Media;
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 
 import 'fs.dart';
 import 'main.dart';
+import 'player.dart';
 
 class Clip {
   Clip(this.fs, this.dir, this.items, this.cut);
@@ -33,6 +35,17 @@ class ExplorerPage extends StatefulWidget {
   State<ExplorerPage> createState() => _ExplorerPageState();
 }
 
+IconData _quickIcon(String n) => switch (n) {
+      'Desktop' => Icons.desktop_windows_outlined,
+      'Download' || 'Downloads' => Icons.download_outlined,
+      'Documents' => Icons.description_outlined,
+      'Pictures' => Icons.image_outlined,
+      'DCIM' => Icons.photo_camera_outlined,
+      'Music' => Icons.music_note_outlined,
+      'Videos' || 'Movies' => Icons.movie_outlined,
+      _ => Icons.folder_outlined,
+    };
+
 class _ExplorerPageState extends State<ExplorerPage> {
   final scaffold = GlobalKey<ScaffoldState>();
   final local = LocalFs();
@@ -52,6 +65,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
   int done = 0;
   List<String> drives = [];
   final quick = <(String, IconData, String)>[];
+  final remoteQuick = <String, List<(String, IconData, String)>>{}; // peer.base -> that device's folders
   final searchCtl = TextEditingController(), addrCtl = TextEditingController();
   final focus = FocusNode();
 
@@ -157,6 +171,11 @@ class _ExplorerPageState extends State<ExplorerPage> {
       if (!ok) return toast(context, 'Access denied, timed out or unreachable');
       r = remotes[pr.base] = RemoteFs(pr);
     }
+    if (!remoteQuick.containsKey(pr.base)) {
+      try {
+        remoteQuick[pr.base] = [for (final q in await r.places()) (q.$1, _quickIcon(q.$1), q.$2)];
+      } catch (_) {}
+    }
     await go(r, '');
   }
 
@@ -243,6 +262,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
   Future<void> openEntry(Entry e) async {
     if (e.isDir) return go(fs, fs.join(path, e.name));
     final src = fs.join(path, e.name), ext = p.extension(e.name).toLowerCase();
+    if (videoExts.contains(ext)) return playVideo(e);
     if (fs is RemoteFs && _risky.contains(ext) && !await confirm('Run a file from another device?', '"${e.name}" came from ${fs.label}. Only open programs you trust.', 'Open anyway')) return;
     File f;
     if (fs is LocalFs) {
@@ -257,6 +277,17 @@ class _ExplorerPageState extends State<ExplorerPage> {
     } else {
       await OpenFilex.open(f.path);
     }
+  }
+
+  // plays [e] and queues the other videos of this folder (in the order shown) so next/previous and auto-advance work
+  void playVideo(Entry e) {
+    final vids = view.where((x) => !x.isDir && videoExts.contains(p.extension(x.name).toLowerCase())).toList();
+    final f = fs;
+    final items = [
+      for (final v in vids)
+        (v.name, f is RemoteFs ? Media(f.peer.u('api/file', {'p': f.join(path, v.name)}).toString(), httpHeaders: f.peer.h) : Media(p.join(path, v.name)))
+    ];
+    Navigator.push(context, MaterialPageRoute(builder: (_) => VideoPage(items: items, index: vids.indexWhere((x) => x.name == e.name))));
   }
 
   void copyCut(bool cut) {
@@ -478,13 +509,15 @@ class _ExplorerPageState extends State<ExplorerPage> {
 
     Widget hdr(String s) => Padding(padding: const EdgeInsets.fromLTRB(16, 16, 16, 4), child: Text(s, style: t.textTheme.labelLarge?.copyWith(color: cs.primary)));
     bool at(Fs f, String pp) => identical(fs, f) && path == pp;
+    final qfs = fs, qlist = fs is RemoteFs ? (remoteQuick[(fs as RemoteFs).peer.base] ?? const []) : quick;
     return Material(
       color: cs.surfaceContainerLow,
       child: SafeArea(
         child: ListView(children: [
-          if (quick.isNotEmpty) hdr('Quick access'),
-          for (final q in quick)
-            ListTile(dense: true, leading: Icon(q.$2), title: Text(q.$1), selected: at(local, q.$3), onTap: () => nav(local, q.$3)),
+          // quick access follows the device being browsed
+          if (qlist.isNotEmpty) hdr(fs is RemoteFs ? 'Quick access · ${fs.label}' : 'Quick access'),
+          for (final q in qlist)
+            ListTile(dense: true, leading: Icon(q.$2), title: Text(q.$1), selected: at(qfs, q.$3), onTap: () => nav(qfs, q.$3)),
           hdr('This device'),
           ListTile(
               dense: true,
