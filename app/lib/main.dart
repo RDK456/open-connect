@@ -34,7 +34,9 @@ String rand(int n) {
   return List.generate(n, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
 }
 
+// Android: only Wi-Fi / hotspot / ethernet, so mobile-data addresses neither show up nor keep the service alive on a new network
 Future<List<String>> localIps() async => (await NetworkInterface.list(type: InternetAddressType.IPv4))
+    .where((i) => !Platform.isAndroid || RegExp(r'^(wlan|swlan|ap|eth)', caseSensitive: false).hasMatch(i.name))
     .expand((i) => i.addresses)
     .map((a) => a.address)
     .where((a) => !a.startsWith('127.') && !a.startsWith('169.254.'))
@@ -57,6 +59,7 @@ class Host {
   final sessions = <String>{};
   final pending = <String, String>{}; // id -> wait | denied | token
   Future<bool> Function(String who)? approve;
+  void Function(String name, String from)? received; // a device just sent us a file
   Future<void> _queue = Future.value();
 
   void addRoot(String path) {
@@ -179,6 +182,7 @@ class Host {
       final sink = File(p.join(d, n)).openWrite();
       await sink.addStream(r.read());
       await sink.close();
+      received?.call(n, (r.context['shelf.io.connection_info'] as HttpConnectionInfo?)?.remoteAddress.address ?? '?');
       return Response.ok('');
     }
     if (path == 'api/rm' && r.method == 'POST') {
@@ -553,6 +557,8 @@ Future<void> initBackground(List<String> args) async {
         channelName: 'Open Connect sharing',
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
+        playSound: false,
+        onlyAlertOnce: true,
       ),
       iosNotificationOptions: const IOSNotificationOptions(),
       foregroundTaskOptions: ForegroundTaskOptions(
@@ -562,12 +568,74 @@ Future<void> initBackground(List<String> args) async {
       ),
     );
     await FlutterForegroundTask.requestNotificationPermission();
-    if (!await FlutterForegroundTask.isRunningService) {
-      await FlutterForegroundTask.startService(
-          serviceId: 256, notificationTitle: 'Open Connect is sharing', notificationText: 'Running in the background');
-    }
+    await startShareService();
+    _watchNetwork();
   }
 }
+
+// Android: the notification stays until the user taps Quit, or the phone has been off this Wi-Fi
+// (out of range / another network) for 15 s while the app is not on screen.
+@pragma('vm:entry-point')
+void taskEntry() => FlutterForegroundTask.setTaskHandler(_QuitHandler());
+
+class _QuitHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
+  @override
+  void onRepeatEvent(DateTime timestamp) {}
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
+  @override
+  void onNotificationButtonPressed(String id) {
+    if (id == 'quit') FlutterForegroundTask.stopService().whenComplete(() => exit(0));
+  }
+}
+
+Set<String> _subnets = {}; // the network the service was started on
+String _lastText = '';
+var _miss = 0;
+
+Set<String> _nets(List<String> ips) => {for (final i in ips) i.split('.').take(3).join('.')};
+
+String _status(List<String> ips) =>
+    '${ips.first}:$port · ${host.sessions.isEmpty ? 'no devices connected yet' : '${host.sessions.length} device(s) connected'}';
+
+Future<void> startShareService() async {
+  final ips = await localIps();
+  if (ips.isEmpty || await FlutterForegroundTask.isRunningService) return;
+  _subnets = _nets(ips);
+  _lastText = _status(ips);
+  await FlutterForegroundTask.startService(
+    serviceId: 256,
+    serviceTypes: [ForegroundServiceTypes.specialUse],
+    notificationTitle: 'Open Connect is sharing',
+    notificationText: _lastText,
+    notificationButtons: const [NotificationButton(id: 'quit', text: 'Quit')],
+    callback: taskEntry,
+  );
+}
+
+void _watchNetwork() => Timer.periodic(const Duration(seconds: 5), (_) async {
+      final ips = await localIps();
+      final onScreen = WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+      // someone is using the app: whatever network it is on now is the right one
+      if (onScreen && ips.isNotEmpty) _subnets = _nets(ips);
+      if (!await FlutterForegroundTask.isRunningService) {
+        if (onScreen) await startShareService();
+        return;
+      }
+      _miss = onScreen || _nets(ips).any(_subnets.contains) ? 0 : _miss + 1;
+      if (_miss >= 3) {
+        await FlutterForegroundTask.stopService();
+        exit(0); // not in range any more: stop serving, free the process
+      }
+      if (ips.isEmpty) return;
+      final text = _status(ips);
+      if (text != _lastText) {
+        _lastText = text;
+        FlutterForegroundTask.updateService(notificationText: text);
+      }
+    });
 
 class BackgroundCard extends StatefulWidget {
   const BackgroundCard({super.key});
@@ -608,10 +676,17 @@ class _BackgroundCardState extends State<BackgroundCard> {
               subtitle: const Text('Closing the window keeps Open Connect running in the system tray.'),
               value: auto,
               onChanged: setAuto)
-          : const ListTile(
-              leading: Icon(Icons.notifications_active_outlined),
-              title: Text('Runs in the background'),
-              subtitle: Text('A notification keeps sharing alive while the app is closed. Disable battery optimization for best results.')),
+          : ListTile(
+              leading: const Icon(Icons.notifications_active_outlined),
+              title: const Text('Runs in the background'),
+              subtitle: const Text(
+                  'A notification keeps sharing alive while you use your phone. It stops when you tap Quit or leave this Wi-Fi. Disable battery optimization for best results.'),
+              trailing: TextButton(
+                  onPressed: () async {
+                    await FlutterForegroundTask.stopService();
+                    exit(0);
+                  },
+                  child: const Text('Quit'))),
     );
   }
 }
@@ -641,6 +716,40 @@ IconData fileIcon(String n) {
     default:
       return Icons.insert_drive_file_outlined;
   }
+}
+
+Color fileColor(String n, ColorScheme cs) {
+  switch (p.extension(n).toLowerCase()) {
+    case '.jpg': case '.jpeg': case '.png': case '.gif': case '.webp': case '.heic': case '.bmp':
+      return const Color(0xFFE91E63);
+    case '.mp4': case '.mkv': case '.mov': case '.avi': case '.webm':
+      return const Color(0xFF8E44AD);
+    case '.mp3': case '.wav': case '.flac': case '.m4a': case '.aac':
+      return const Color(0xFFF57C00);
+    case '.pdf': case '.doc': case '.docx': case '.txt': case '.md': case '.xls': case '.xlsx': case '.ppt': case '.pptx':
+      return const Color(0xFF2563EB);
+    case '.zip': case '.rar': case '.7z': case '.tar': case '.gz':
+      return const Color(0xFFB8860B);
+    case '.apk': case '.exe': case '.msi':
+      return const Color(0xFF2E9E5B);
+    default:
+      return cs.onSurfaceVariant;
+  }
+}
+
+/// Icon on a soft tinted rounded square (file-type colour), the look of current Material 3 file managers.
+class IconTile extends StatelessWidget {
+  const IconTile(this.icon, this.color, {super.key, this.size = 40});
+  final IconData icon;
+  final Color color;
+  final double size;
+  @override
+  Widget build(BuildContext c) => Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(color: color.withValues(alpha: .15), borderRadius: BorderRadius.circular(size * .32)),
+        child: Icon(icon, color: color, size: size * .55),
+      );
 }
 
 void main(List<String> args) async {
@@ -686,6 +795,10 @@ void main(List<String> args) async {
     final ok = await _askApproval(who);
     if (Platform.isWindows) windowManager.setAlwaysOnTop(false).catchError((_) {});
     return ok;
+  };
+  host.received = (name, from) {
+    final c = navKey.currentContext;
+    if (c != null) toast(c, 'Received "$name" from $from');
   };
   if (Platform.isAndroid && await Permission.manageExternalStorage.isGranted) host.addRoot('/storage/emulated/0');
   // share every drive on Windows so the whole PC is browsable once a device is approved
@@ -740,9 +853,16 @@ ThemeData _theme(Brightness b) => ThemeData(
       cardTheme: CardThemeData(
         elevation: 0,
         margin: const EdgeInsets.symmetric(vertical: 4),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
       ),
-      listTileTheme: const ListTileThemeData(minVerticalPadding: 8),
+      listTileTheme: ListTileThemeData(minVerticalPadding: 8, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))),
+      chipTheme: const ChipThemeData(shape: StadiumBorder(), side: BorderSide.none),
+      filledButtonTheme: FilledButtonThemeData(style: FilledButton.styleFrom(minimumSize: const Size(0, 44))),
+      textTheme: const TextTheme(
+        headlineSmall: TextStyle(fontWeight: FontWeight.w700),
+        titleLarge: TextStyle(fontWeight: FontWeight.w700),
+        titleMedium: TextStyle(fontWeight: FontWeight.w600),
+      ),
       snackBarTheme: const SnackBarThemeData(behavior: SnackBarBehavior.floating),
     );
 

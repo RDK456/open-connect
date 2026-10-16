@@ -62,7 +62,8 @@ class _ExplorerPageState extends State<ExplorerPage> {
   String sortCol = 'name', filter = '';
   bool asc = true;
   String? busy;
-  int done = 0;
+  int done = 0, total = 0; // bytes moved / expected (0 = unknown)
+  bool lastOk = true;
   List<String> drives = [];
   final quick = <(String, IconData, String)>[];
   final remoteQuick = <String, List<(String, IconData, String)>>{}; // peer.base -> that device's folders
@@ -158,7 +159,8 @@ class _ExplorerPageState extends State<ExplorerPage> {
     });
   }
 
-  Future<void> connect(Peer pr) async {
+  // approved connection to [pr] (asks the other device on first use), or null if denied / unreachable
+  Future<RemoteFs?> remoteFor(Peer pr) async {
     var r = remotes[pr.base];
     if (r == null) {
       setState(() { busy = 'Waiting for approval on ${pr.name}...'; done = 0; });
@@ -166,9 +168,12 @@ class _ExplorerPageState extends State<ExplorerPage> {
       try {
         ok = await requestAccess(pr);
       } catch (_) {}
-      if (!mounted) return;
+      if (!mounted) return null;
       setState(() => busy = null);
-      if (!ok) return toast(context, 'Access denied, timed out or unreachable');
+      if (!ok) {
+        toast(context, 'Access denied, timed out or unreachable');
+        return null;
+      }
       r = remotes[pr.base] = RemoteFs(pr);
     }
     if (!remoteQuick.containsKey(pr.base)) {
@@ -176,7 +181,71 @@ class _ExplorerPageState extends State<ExplorerPage> {
         remoteQuick[pr.base] = [for (final q in await r.places()) (q.$1, _quickIcon(q.$1), q.$2)];
       } catch (_) {}
     }
-    await go(r, '');
+    return r;
+  }
+
+  Future<void> connect(Peer pr) async {
+    final r = await remoteFor(pr);
+    if (r != null) await go(r, '');
+  }
+
+  Future<Peer?> pickDevice() async {
+    if (found.isEmpty && !scanning) await doScan();
+    if (!mounted) return null;
+    if (found.isEmpty) {
+      toast(context, 'No devices found. Open Open Connect on the other device (same Wi-Fi).');
+      return null;
+    }
+    if (found.length == 1) return found.first;
+    return showModalBottomSheet<Peer>(
+      context: context,
+      showDragHandle: true,
+      builder: (c) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Padding(padding: const EdgeInsets.fromLTRB(24, 0, 24, 8), child: Align(alignment: Alignment.centerLeft, child: Text('Send to', style: Theme.of(c).textTheme.titleLarge))),
+          for (final pr in found)
+            ListTile(
+              leading: IconTile(remotes.containsKey(pr.base) ? Icons.lan : Icons.lan_outlined, Theme.of(c).colorScheme.primary),
+              title: Text(pr.name),
+              subtitle: Text(pr.base.replaceFirst(RegExp(r'^https?://'), '')),
+              onTap: () => Navigator.pop(c, pr),
+            ),
+        ]),
+      ),
+    );
+  }
+
+  // Send to another device's Downloads without browsing it: the selection (from either device), or files picked here.
+  Future<void> sendTo() async {
+    final pr = await pickDevice();
+    if (pr == null) return;
+    final r = await remoteFor(pr);
+    if (r == null || !mounted) return;
+    final dl = (remoteQuick[pr.base] ?? const []).where((q) => q.$1 == 'Download' || q.$1 == 'Downloads').firstOrNull;
+    if (dl == null) return toast(context, '${pr.name} shares no Downloads folder');
+    final fromSel = sel.isNotEmpty && canWrite && !identical(fs, r);
+    final files = <(String, String)>[]; // (path, name) picked on this device
+    if (!fromSel) {
+      for (final f in await FilePicker.pickFiles()) {
+        if (f.path != null) files.add((f.path!, f.name));
+      }
+      if (files.isEmpty) return;
+    }
+    final items = fromSel ? selected : const <Entry>[];
+    total = fromSel ? items.where((e) => !e.isDir).fold(0, (a, e) => a + e.size) : files.fold(0, (a, f) => a + File(f.$1).lengthSync());
+    final n = fromSel ? items.length : files.length;
+    await run('Sending $n item${n == 1 ? '' : 's'} to ${pr.name}...', (b) async {
+      if (fromSel) {
+        for (final e in items) {
+          await transfer(fs, path, e, r, dl.$3, move: false, onBytes: b);
+        }
+      } else {
+        for (final f in files) {
+          await r.upload(dl.$3, File(f.$1), f.$2, b);
+        }
+      }
+    });
+    if (mounted && lastOk) toast(context, 'Sent $n item${n == 1 ? '' : 's'} to ${pr.name} · ${dl.$1}');
   }
 
   Future<void> byIp() async {
@@ -221,16 +290,17 @@ class _ExplorerPageState extends State<ExplorerPage> {
       false;
 
   Future<void> run(String label, Future<void> Function(void Function(int) bytes) body) async {
-    setState(() { busy = label; done = 0; });
+    setState(() { busy = label; done = 0; lastOk = true; });
     try {
       await body((n) {
         done += n;
         if (mounted) setState(() {});
       });
     } catch (e) {
+      lastOk = false;
       if (mounted) toast(context, '$e');
     }
-    if (mounted) setState(() => busy = null);
+    if (mounted) setState(() { busy = null; total = 0; });
   }
 
   List<Entry> get selected => (items ?? []).where((e) => sel.contains(e.name)).toList();
@@ -359,12 +429,13 @@ class _ExplorerPageState extends State<ExplorerPage> {
     if (sel.isEmpty || fs is LocalFs) return;
     if (!await ensureStorage()) return toast(context, 'Storage permission needed');
     final dl = downloadsDir(), items = selected;
+    total = items.where((e) => !e.isDir).fold(0, (a, e) => a + e.size);
     await run('Saving to Downloads...', (b) async {
       for (final e in items) {
         await transfer(fs, path, e, local, dl, move: false, onBytes: b);
       }
     });
-    if (mounted) toast(context, 'Saved to $dl');
+    if (mounted && lastOk) toast(context, 'Saved to $dl');
   }
 
   // ---------------------------------------------------------------- selection
@@ -407,6 +478,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
       if (e != null) ...[
         mi('open', Icons.open_in_new, 'Open'),
         if (fs is RemoteFs) mi('save', Icons.download_outlined, 'Save to Downloads'),
+        mi('send', Icons.send_rounded, 'Send to...'),
         const PopupMenuDivider(),
         mi('cut', Icons.content_cut, 'Cut', on: hasSel),
         mi('copy', Icons.content_copy, 'Copy', on: hasSel),
@@ -431,6 +503,8 @@ class _ExplorerPageState extends State<ExplorerPage> {
         if (e != null) openEntry(e);
       case 'save':
         saveToDownloads();
+      case 'send':
+        sendTo();
       case 'cut':
         copyCut(true);
       case 'copy':
@@ -510,22 +584,29 @@ class _ExplorerPageState extends State<ExplorerPage> {
     Widget hdr(String s) => Padding(padding: const EdgeInsets.fromLTRB(16, 16, 16, 4), child: Text(s, style: t.textTheme.labelLarge?.copyWith(color: cs.primary)));
     bool at(Fs f, String pp) => identical(fs, f) && path == pp;
     final qfs = fs, qlist = fs is RemoteFs ? (remoteQuick[(fs as RemoteFs).peer.base] ?? const []) : quick;
+    Widget tile(IconData i, String title, bool on, VoidCallback f, {String? sub}) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+          child: ListTile(
+            dense: true,
+            leading: Icon(i),
+            title: Text(title),
+            subtitle: sub == null ? null : Text(sub),
+            selected: on,
+            selectedTileColor: cs.secondaryContainer,
+            selectedColor: cs.onSecondaryContainer,
+            onTap: f,
+          ),
+        );
     return Material(
       color: cs.surfaceContainerLow,
       child: SafeArea(
         child: ListView(children: [
           // quick access follows the device being browsed
           if (qlist.isNotEmpty) hdr(fs is RemoteFs ? 'Quick access · ${fs.label}' : 'Quick access'),
-          for (final q in qlist)
-            ListTile(dense: true, leading: Icon(q.$2), title: Text(q.$1), selected: at(qfs, q.$3), onTap: () => nav(qfs, q.$3)),
+          for (final q in qlist) tile(q.$2, q.$1, at(qfs, q.$3), () => nav(qfs, q.$3)),
           hdr('This device'),
-          ListTile(
-              dense: true,
-              leading: Icon(Platform.isAndroid ? Icons.phone_android : Icons.computer),
-              title: Text(Platform.isAndroid ? 'This phone' : 'This PC'),
-              selected: at(local, ''),
-              onTap: () => nav(local, '')),
-          for (final d in drives) ListTile(dense: true, leading: const Icon(Icons.storage_outlined), title: Text(d), selected: at(local, d), onTap: () => nav(local, d)),
+          tile(Platform.isAndroid ? Icons.phone_android : Icons.computer, Platform.isAndroid ? 'This phone' : 'This PC', at(local, ''), () => nav(local, '')),
+          for (final d in drives) tile(Icons.storage_outlined, d, at(local, d), () => nav(local, d)),
           hdr('Network'),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -540,16 +621,15 @@ class _ExplorerPageState extends State<ExplorerPage> {
           if (found.isEmpty && !scanning)
             Padding(padding: const EdgeInsets.all(16), child: Text('No devices found. Open Open Connect on another device on this Wi-Fi.', style: t.textTheme.bodySmall)),
           for (final pr in found)
-            ListTile(
-              dense: true,
-              leading: Icon(remotes.containsKey(pr.base) ? Icons.lan : Icons.lan_outlined),
-              title: Text(pr.name),
-              subtitle: Text(pr.base.replaceFirst(RegExp(r'^https?://'), '')),
-              selected: fs is RemoteFs && (fs as RemoteFs).peer.base == pr.base,
-              onTap: () {
+            tile(
+              remotes.containsKey(pr.base) ? Icons.lan : Icons.lan_outlined,
+              pr.name,
+              fs is RemoteFs && (fs as RemoteFs).peer.base == pr.base,
+              () {
                 if (drawer) Navigator.pop(c);
                 connect(pr);
               },
+              sub: pr.base.replaceFirst(RegExp(r'^https?://'), ''),
             ),
         ]),
       ),
@@ -624,11 +704,13 @@ class _ExplorerPageState extends State<ExplorerPage> {
           height: 40,
           child: TextField(
             controller: searchCtl,
-            decoration: InputDecoration(
+              decoration: InputDecoration(
               isDense: true,
+              filled: true,
+              fillColor: cs.surfaceContainerHighest,
               hintText: 'Search',
               prefixIcon: const Icon(Icons.search, size: 20),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(20), borderSide: BorderSide.none),
             ),
             onChanged: (v) => setState(() => filter = v.toLowerCase()),
           ),
@@ -644,6 +726,8 @@ class _ExplorerPageState extends State<ExplorerPage> {
       scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(children: [
+        FilledButton.icon(icon: const Icon(Icons.send_rounded, size: 18), label: const Text('Send to...'), onPressed: sendTo),
+        const SizedBox(width: 4),
         TextButton.icon(icon: const Icon(Icons.create_new_folder_outlined), label: const Text('New folder'), onPressed: canWrite ? newFolder : null),
         TextButton.icon(icon: const Icon(Icons.upload_file), label: const Text('Add files'), onPressed: canWrite ? addFiles : null),
         const SizedBox(height: 24, child: VerticalDivider()),
@@ -652,7 +736,8 @@ class _ExplorerPageState extends State<ExplorerPage> {
         ib(Icons.content_paste, _clip == null ? 'Paste (Ctrl+V)' : 'Paste ${_clip!.items.length} item(s) (Ctrl+V)', _clip != null && canWrite ? paste : null),
         ib(Icons.drive_file_rename_outline, 'Rename (F2)', sel.length == 1 && canWrite ? rename : null),
         ib(Icons.delete_outline, 'Delete (Del)', s ? delete : null),
-        if (fs is RemoteFs) ib(Icons.download_outlined, 'Save to Downloads', sel.isNotEmpty ? saveToDownloads : null),
+        if (fs is RemoteFs)
+          TextButton.icon(icon: const Icon(Icons.download_outlined), label: const Text('Get'), onPressed: sel.isNotEmpty ? saveToDownloads : null),
         const SizedBox(height: 24, child: VerticalDivider()),
         PopupMenuButton<String>(
           tooltip: 'Sort',
@@ -731,7 +816,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
         return Column(children: [
           if (full)
             Padding(
-              padding: const EdgeInsets.only(left: 48, right: 12),
+              padding: const EdgeInsets.only(left: 68, right: 20),
               child: Row(children: [
                 header(c, 'Name', 'name'),
                 header(c, 'Date modified', 'date', width: 170),
@@ -742,7 +827,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
           Expanded(
             child: ListView.builder(
               itemCount: l.length,
-              itemExtent: full ? 40 : 60,
+              itemExtent: full ? 44 : 64,
               itemBuilder: (_, i) => row(c, l[i], i, full),
             ),
           ),
@@ -751,10 +836,10 @@ class _ExplorerPageState extends State<ExplorerPage> {
 
   bool isCut(Entry e) => _clip != null && _clip!.cut && identical(_clip!.fs, fs) && _clip!.dir == path && _clip!.items.any((x) => x.name == e.name);
 
-  Widget leadingIcon(Entry e, ColorScheme cs) => Icon(
+  Widget leadingIcon(Entry e, ColorScheme cs, {double size = 40}) => IconTile(
         path.isEmpty ? Icons.storage : (e.isDir ? Icons.folder : fileIcon(e.name)),
-        color: e.isDir ? cs.primary : cs.onSurfaceVariant,
-        size: 24,
+        e.isDir ? cs.primary : fileColor(e.name, cs),
+        size: size,
       );
 
   Widget row(BuildContext c, Entry e, int i, bool full) {
@@ -762,9 +847,13 @@ class _ExplorerPageState extends State<ExplorerPage> {
     final size = e.isDir ? '' : fmtSize(e.size);
     return Opacity(
       opacity: isCut(e) ? .5 : 1,
-      child: Material(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        child: Material(
         color: s ? cs.secondaryContainer : Colors.transparent,
+        borderRadius: BorderRadius.circular(16),
         child: InkWell(
+          borderRadius: BorderRadius.circular(16),
           onTap: () => tapEntry(e, i),
           onDoubleTap: Platform.isAndroid ? null : () => openEntry(e),
           onLongPress: Platform.isAndroid ? () => toggle(e, i) : null,
@@ -775,7 +864,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Row(children: [
-              if (Platform.isAndroid && sel.isNotEmpty) Checkbox(value: s, onChanged: (_) => toggle(e, i)) else leadingIcon(e, cs),
+              if (Platform.isAndroid && sel.isNotEmpty) Checkbox(value: s, onChanged: (_) => toggle(e, i)) else leadingIcon(e, cs, size: full ? 32 : 40),
               const SizedBox(width: 12),
               if (full) ...[
                 Expanded(child: Text(e.name, maxLines: 1, overflow: TextOverflow.ellipsis)),
@@ -794,6 +883,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
           ),
         ),
       ),
+      ),
     );
   }
 
@@ -809,9 +899,9 @@ class _ExplorerPageState extends State<ExplorerPage> {
           opacity: isCut(e) ? .5 : 1,
           child: Material(
             color: s ? cs.secondaryContainer : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(20),
             child: InkWell(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(20),
               onTap: () => tapEntry(e, i),
               onDoubleTap: Platform.isAndroid ? null : () => openEntry(e),
               onLongPress: Platform.isAndroid ? () => toggle(e, i) : null,
@@ -822,7 +912,7 @@ class _ExplorerPageState extends State<ExplorerPage> {
               child: Padding(
                 padding: const EdgeInsets.all(8),
                 child: Column(children: [
-                  Icon(path.isEmpty ? Icons.storage : (e.isDir ? Icons.folder : fileIcon(e.name)), size: 44, color: e.isDir ? cs.primary : cs.onSurfaceVariant),
+                  leadingIcon(e, cs, size: 52),
                   const SizedBox(height: 6),
                   Text(e.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: Theme.of(c).textTheme.bodySmall),
                 ]),
@@ -838,14 +928,14 @@ class _ExplorerPageState extends State<ExplorerPage> {
     final cs = Theme.of(c).colorScheme, l = view;
     final selSize = selected.fold<int>(0, (a, e) => a + e.size);
     return Column(mainAxisSize: MainAxisSize.min, children: [
-      if (busy != null) const LinearProgressIndicator(),
+      if (busy != null) LinearProgressIndicator(value: total > 0 ? (done / total).clamp(0, 1).toDouble() : null),
       Container(
         width: double.infinity,
         color: cs.surfaceContainerLow,
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
         child: Text(
           busy != null
-              ? '$busy${done > 0 ? '  ${fmtSize(done)}' : ''}'
+              ? '$busy${done > 0 ? '  ${fmtSize(done)}${total > 0 ? ' / ${fmtSize(total)}' : ''}' : ''}'
               : '${l.length} item${l.length == 1 ? '' : 's'}${sel.isNotEmpty ? '  ·  ${sel.length} selected${selSize > 0 ? ' (${fmtSize(selSize)})' : ''}' : ''}',
           style: Theme.of(c).textTheme.bodySmall,
         ),
