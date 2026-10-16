@@ -326,7 +326,7 @@ String downloadsDir() =>
 // Android downloads the full APK and hands it to the system installer.
 // ponytail: only the machine holding %APPDATA%\OpenConnect\updates publishes; no relay between peers.
 // ponytail: file-level delta: swap in bsdiff patches if app.so gets too big to resend.
-const appBuild = 6, appVersion = '1.4.0';
+const appBuild = 7, appVersion = '1.5.0';
 
 /// How this device appears to others (shown in their scan). Defaults to the computer name; editable in Settings.
 String deviceName = Platform.localHostname;
